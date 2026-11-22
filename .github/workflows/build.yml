@@ -95,7 +95,7 @@ jobs:
           cmake_minimum_required(VERSION 3.22.1)
           project("agentterm")
           add_library(agentterm SHARED pty_bridge.cpp)
-          target_link_libraries(agentterm log util)
+          target_link_libraries(agentterm log)
           EOF
 
           cat << 'EOF' > app/src/main/cpp/pty_bridge.cpp
@@ -326,3 +326,4 @@ jobs:
         with:
           name: AgentTerm-APK
           path: app/build/outputs/apk/debug/app-debug.apk
+ 
