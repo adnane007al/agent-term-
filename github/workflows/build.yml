@@ -16,3 +16,343 @@ jobs:
         uses: android-actions/setup-android@v3
       - name: Install NDK
         run: sdkmanager "ndk;26.1.10909125" "cmake;3.22.1"
+            - name: Generate Project Files
+        run: |
+          mkdir -p app/src/main/cpp app/src/main/java/com/example/agentterm
+
+          cat << 'EOF' > settings.gradle.kts
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "AgentTerm"
+          include(":app")
+          EOF
+
+          cat << 'EOF' > build.gradle.kts
+          plugins {
+              id("com.android.application") version "8.2.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.22" apply false
+          }
+          EOF
+
+          cat << 'EOF' > gradle.properties
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF
+
+          cat << 'EOF' > app/build.gradle.kts
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.agentterm"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.agentterm"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+                  ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
+              }
+              externalNativeBuild {
+                  cmake { path = file("src/main/cpp/CMakeLists.txt") }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("androidx.core:core-ktx:1.12.0")
+              implementation("androidx.appcompat:appcompat:1.6.1")
+              implementation("com.google.android.material:material:1.11.0")
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <application
+                  android:label="AgentTerm"
+                  android:theme="@style/Theme.MaterialComponents.DayNight.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > app/src/main/cpp/CMakeLists.txt
+          cmake_minimum_required(VERSION 3.22.1)
+          project("agentterm")
+          add_library(agentterm SHARED pty_bridge.cpp)
+          target_link_libraries(agentterm log util)
+          EOF
+
+          cat << 'EOF' > app/src/main/cpp/pty_bridge.cpp
+          #include <jni.h>
+          #include <pty.h>
+          #include <unistd.h>
+          #include <fcntl.h>
+          #include <signal.h>
+          #include <sys/wait.h>
+          #include <string>
+
+          static int g_master = -1;
+          static pid_t g_pid = -1;
+
+          extern "C" JNIEXPORT jboolean JNICALL
+          Java_com_example_agentterm_MainActivity_startShell(JNIEnv*, jobject) {
+              if (g_master >= 0) return JNI_TRUE;
+              int master = -1;
+              pid_t pid = forkpty(&master, nullptr, nullptr, nullptr);
+              if (pid < 0) return JNI_FALSE;
+              if (pid == 0) {
+                  setenv("TERM", "xterm-256color", 1);
+                  setenv("PATH", "/system/bin:/system/xbin", 1);
+                  execl("/system/bin/sh", "sh", nullptr);
+                  _exit(127);
+              }
+              int flags = fcntl(master, F_GETFL, 0);
+              fcntl(master, F_SETFL, flags | O_NONBLOCK);
+              g_master = master;
+              g_pid = pid;
+              return JNI_TRUE;
+          }
+
+          extern "C" JNIEXPORT void JNICALL
+          Java_com_example_agentterm_MainActivity_sendRaw(JNIEnv* env, jobject, jstring data) {
+              if (g_master < 0 || !data) return;
+              const char* chars = env->GetStringUTFChars(data, nullptr);
+              if (chars) {
+                  std::string s(chars);
+                  write(g_master, s.c_str(), s.size());
+                  env->ReleaseStringUTFChars(data, chars);
+              }
+          }
+
+          extern "C" JNIEXPORT jstring JNICALL
+          Java_com_example_agentterm_MainActivity_readOutput(JNIEnv* env, jobject) {
+              if (g_master < 0) return env->NewStringUTF("");
+              char buf[2048];
+              std::string out;
+              ssize_t n;
+              while ((n = read(g_master, buf, sizeof(buf) - 1)) > 0) {
+                  buf[n] = '\0';
+                  out.append(buf);
+              }
+              return env->NewStringUTF(out.c_str());
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/example/agentterm/MainActivity.kt
+          package com.example.agentterm
+
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.Gravity
+          import android.widget.*
+          import androidx.appcompat.app.AppCompatActivity
+          import com.google.android.material.card.MaterialCardView
+
+          class MainActivity : AppCompatActivity() {
+              companion object {
+                  init { System.loadLibrary("agentterm") }
+              }
+
+              external fun startShell(): Boolean
+              external fun sendRaw(data: String)
+              external fun readOutput(): String
+
+              private lateinit var cardsContainer: LinearLayout
+              private lateinit var scrollView: ScrollView
+              private var currentOutputView: TextView? = null
+              private val handler = Handler(Looper.getMainLooper())
+
+              private val pollRunnable = object : Runnable {
+                  override fun run() {
+                      val chunk = readOutput()
+                      if (chunk.isNotEmpty()) {
+                          appendOutput(chunk)
+                      }
+                      handler.postDelayed(this, 80)
+                  }
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setBackgroundColor(Color.parseColor("#0F172A"))
+                      setPadding(24, 36, 24, 24)
+                  }
+
+                  val header = TextView(this).apply {
+                      text = "⚡ AgentTerm (Block Prototype)"
+                      setTextColor(Color.parseColor("#38BDF8"))
+                      textSize = 18f
+                      setTypeface(null, Typeface.BOLD)
+                      setPadding(0, 0, 0, 20)
+                  }
+                  root.addView(header)
+
+                  scrollView = ScrollView(this).apply {
+                      layoutParams = LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
+                      )
+                  }
+                  cardsContainer = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                  }
+                  scrollView.addView(cardsContainer)
+                  root.addView(scrollView)
+
+                  val touchBar = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      setPadding(0, 12, 0, 12)
+                  }
+                  val quickKeys = listOf(
+                      "Ctrl+C" to "\u0003",
+                      "Tab" to "\t",
+                      "ls -la" to "ls -la\n",
+                      "pwd" to "pwd\n",
+                      "Clear" to "CLEAR"
+                  )
+                  for ((label, payload) in quickKeys) {
+                      val btn = Button(this).apply {
+                          text = label
+                          textSize = 12f
+                          setTextColor(Color.WHITE)
+                          setBackgroundColor(Color.parseColor("#1E293B"))
+                          setOnClickListener {
+                              if (payload == "CLEAR") {
+                                  cardsContainer.removeAllViews()
+                                  currentOutputView = null
+                              } else {
+                                  if (payload.endsWith("\n")) addBlock(payload.trim())
+                                  sendRaw(payload)
+                              }
+                          }
+                      }
+                      val lp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                          setMargins(6, 0, 6, 0)
+                      }
+                      touchBar.addView(btn, lp)
+                  }
+                  root.addView(touchBar)
+
+                  val inputRow = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                  }
+                  val input = EditText(this).apply {
+                      hint = "اكتب أمراً هنا (مثل: uname -a)..."
+                      setHintTextColor(Color.parseColor("#64748B"))
+                      setTextColor(Color.WHITE)
+                      setBackgroundColor(Color.parseColor("#1E293B"))
+                      setPadding(24, 24, 24, 24)
+                      layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                  }
+                  val runBtn = Button(this).apply {
+                      text = "تشغيل"
+                      setTextColor(Color.parseColor("#0F172A"))
+                      setBackgroundColor(Color.parseColor("#38BDF8"))
+                      setOnClickListener {
+                          val cmd = input.text.toString().trim()
+                          if (cmd.isNotEmpty()) {
+                              addBlock(cmd)
+                              sendRaw(cmd + "\n")
+                              input.text.clear()
+                          }
+                      }
+                  }
+                  inputRow.addView(input)
+                  inputRow.addView(runBtn)
+                  root.addView(inputRow)
+
+                  setContentView(root)
+
+                  if (startShell()) {
+                      addBlock("Session Started (/system/bin/sh)")
+                      handler.post(pollRunnable)
+                  } else {
+                      addBlock("Error: Failed to start PTY shell")
+                  }
+              }
+
+              private fun addBlock(commandTitle: String) {
+                  val card = MaterialCardView(this).apply {
+                      setCardBackgroundColor(Color.parseColor("#1E293B"))
+                      radius = 24f
+                      cardElevation = 4f
+                      layoutParams = LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT,
+                          LinearLayout.LayoutParams.WRAP_CONTENT
+                      ).apply { setMargins(0, 0, 0, 20) }
+                  }
+
+                  val box = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(24, 20, 24, 20)
+                  }
+
+                  val titleView = TextView(this).apply {
+                      text = "$ $commandTitle"
+                      setTextColor(Color.parseColor("#34D399"))
+                      typeface = Typeface.MONOSPACE
+                      textSize = 13f
+                  }
+
+                  val outView = TextView(this).apply {
+                      text = ""
+                      setTextColor(Color.parseColor("#E2E8F0"))
+                      typeface = Typeface.MONOSPACE
+                      textSize = 12f
+                      setPadding(0, 10, 0, 0)
+                  }
+
+                  box.addView(titleView)
+                  box.addView(outView)
+                  card.addView(box)
+                  cardsContainer.addView(card)
+                  currentOutputView = outView
+                  scrollView.post { scrollView.fullScroll(ScrollView.FOCUS_DOWN) }
+              }
+
+              private fun appendOutput(text: String) {
+                  if (currentOutputView == null) addBlock("Output")
+                  currentOutputView?.append(text)
+                  scrollView.post { scrollView.fullScroll(ScrollView.FOCUS_DOWN) }
+              }
+          }
+          EOF
+
+      - name: Generate Gradle Wrapper & Build APK
+        run: |
+          gradle wrapper --gradle-version 8.5
+          chmod +x gradlew
+          ./gradlew assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: AgentTerm-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
