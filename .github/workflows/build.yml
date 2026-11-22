@@ -1,8 +1,7 @@
-name: Build Smart Agent Terminal APK
+name: Build APK
 
 on:
   workflow_dispatch:
-  push:
 
 jobs:
   build:
@@ -13,19 +12,22 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
-
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
-
-      - name: Install NDK & CMake
+      - name: Install NDK
         run: sdkmanager "ndk;26.1.10909125" "cmake;3.22.1"
-
-      - name: Generate Project
+            - name: Generate Project Files
         run: |
           mkdir -p app/src/main/cpp app/src/main/java/com/example/agentterm
+
           cat << 'EOF' > settings.gradle.kts
-          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
-          dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
           rootProject.name = "AgentTerm"
           include(":app")
           EOF
@@ -58,8 +60,13 @@ jobs:
                   versionName = "1.0"
                   ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
               }
-              externalNativeBuild { cmake { path = file("src/main/cpp/CMakeLists.txt") } }
-              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              externalNativeBuild {
+                  cmake { path = file("src/main/cpp/CMakeLists.txt") }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
               kotlinOptions { jvmTarget = "17" }
           }
           dependencies {
@@ -73,8 +80,13 @@ jobs:
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-permission android:name="android.permission.INTERNET" />
-              <application android:label="AgentTerm" android:theme="@style/Theme.MaterialComponents.DayNight.NoActionBar">
-                  <activity android:name=".MainActivity" android:exported="true" android:windowSoftInputMode="adjustResize">
+              <application
+                  android:label="AgentTerm"
+                  android:theme="@style/Theme.MaterialComponents.DayNight.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize">
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN" />
                           <category android:name="android.intent.category.LAUNCHER" />
@@ -96,9 +108,12 @@ jobs:
           #include <pty.h>
           #include <unistd.h>
           #include <fcntl.h>
+          #include <signal.h>
+          #include <sys/wait.h>
           #include <string>
 
           static int g_master = -1;
+          static pid_t g_pid = -1;
 
           extern "C" JNIEXPORT jboolean JNICALL
           Java_com_example_agentterm_MainActivity_startShell(JNIEnv*, jobject) {
@@ -115,6 +130,7 @@ jobs:
               int flags = fcntl(master, F_GETFL, 0);
               fcntl(master, F_SETFL, flags | O_NONBLOCK);
               g_master = master;
+              g_pid = pid;
               return JNI_TRUE;
           }
 
@@ -157,7 +173,10 @@ jobs:
           import com.google.android.material.card.MaterialCardView
 
           class MainActivity : AppCompatActivity() {
-              companion object { init { System.loadLibrary("agentterm") } }
+              companion object {
+                  init { System.loadLibrary("agentterm") }
+              }
+
               external fun startShell(): Boolean
               external fun sendRaw(data: String)
               external fun readOutput(): String
@@ -166,21 +185,26 @@ jobs:
               private lateinit var scrollView: ScrollView
               private var currentOutputView: TextView? = null
               private val handler = Handler(Looper.getMainLooper())
+
               private val pollRunnable = object : Runnable {
                   override fun run() {
                       val chunk = readOutput()
-                      if (chunk.isNotEmpty()) appendOutput(chunk)
+                      if (chunk.isNotEmpty()) {
+                          appendOutput(chunk)
+                      }
                       handler.postDelayed(this, 80)
                   }
               }
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
+
                   val root = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
                       setBackgroundColor(Color.parseColor("#0F172A"))
                       setPadding(24, 36, 24, 24)
                   }
+
                   val header = TextView(this).apply {
                       text = "⚡ AgentTerm (Block Prototype)"
                       setTextColor(Color.parseColor("#38BDF8"))
@@ -191,9 +215,13 @@ jobs:
                   root.addView(header)
 
                   scrollView = ScrollView(this).apply {
-                      layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
+                      layoutParams = LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
+                      )
                   }
-                  cardsContainer = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  cardsContainer = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                  }
                   scrollView.addView(cardsContainer)
                   root.addView(scrollView)
 
@@ -224,7 +252,10 @@ jobs:
                               }
                           }
                       }
-                      touchBar.addView(btn, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { setMargins(6, 0, 6, 0) })
+                      val lp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                          setMargins(6, 0, 6, 0)
+                      }
+                      touchBar.addView(btn, lp)
                   }
                   root.addView(touchBar)
 
@@ -256,6 +287,7 @@ jobs:
                   inputRow.addView(input)
                   inputRow.addView(runBtn)
                   root.addView(inputRow)
+
                   setContentView(root)
 
                   if (startShell()) {
@@ -271,18 +303,24 @@ jobs:
                       setCardBackgroundColor(Color.parseColor("#1E293B"))
                       radius = 24f
                       cardElevation = 4f
-                      layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { setMargins(0, 0, 0, 20) }
+                      layoutParams = LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT,
+                          LinearLayout.LayoutParams.WRAP_CONTENT
+                      ).apply { setMargins(0, 0, 0, 20) }
                   }
+
                   val box = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
                       setPadding(24, 20, 24, 20)
                   }
+
                   val titleView = TextView(this).apply {
                       text = "$ $commandTitle"
                       setTextColor(Color.parseColor("#34D399"))
                       typeface = Typeface.MONOSPACE
                       textSize = 13f
                   }
+
                   val outView = TextView(this).apply {
                       text = ""
                       setTextColor(Color.parseColor("#E2E8F0"))
@@ -290,6 +328,7 @@ jobs:
                       textSize = 12f
                       setPadding(0, 10, 0, 0)
                   }
+
                   box.addView(titleView)
                   box.addView(outView)
                   card.addView(box)
@@ -306,7 +345,7 @@ jobs:
           }
           EOF
 
-      - name: Build APK
+      - name: Generate Gradle Wrapper & Build APK
         run: |
           gradle wrapper --gradle-version 8.5
           chmod +x gradlew
