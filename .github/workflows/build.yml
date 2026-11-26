@@ -575,7 +575,7 @@ jobs:
                       val n = input.read(buf, 0, toRead)
                       if (n <= 0) break
                       fos.write(buf, 0, n)
-                      remaining -= n
+                      remaining -= n.toLong()
                   }
               }
 
@@ -586,7 +586,7 @@ jobs:
                       val toRead = minOf(remaining, buf.size.toLong()).toInt()
                       val n = input.read(buf, 0, toRead)
                       if (n <= 0) break
-                      remaining -= n
+                      remaining -= n.toLong()
                   }
               }
 
