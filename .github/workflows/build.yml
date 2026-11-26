@@ -61,8 +61,8 @@ jobs:
                   applicationId = "com.example.agentterm"
                   minSdk = 24
                   targetSdk = 34
-                  versionCode = 1
-                  versionName = "1.0"
+                  versionCode = 2
+                  versionName = "1.3"
                   ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
               }
               externalNativeBuild { cmake { path = file("src/main/cpp/CMakeLists.txt") } }
@@ -108,17 +108,47 @@ jobs:
           static int g_master = -1;
 
           extern "C" JNIEXPORT jboolean JNICALL
-          Java_com_example_agentterm_MainActivity_startShell(JNIEnv*, jobject) {
+          Java_com_example_agentterm_MainActivity_startShell(
+              JNIEnv* env,
+              jobject,
+              jstring homeDir,
+              jstring tmpDir,
+              jstring nativeLibDir
+          ) {
               if (g_master >= 0) return JNI_TRUE;
+
+              const char* homeChars = homeDir ? env->GetStringUTFChars(homeDir, nullptr) : nullptr;
+              const char* tmpChars = tmpDir ? env->GetStringUTFChars(tmpDir, nullptr) : nullptr;
+              const char* libChars = nativeLibDir ? env->GetStringUTFChars(nativeLibDir, nullptr) : nullptr;
+
+              std::string homeStr = homeChars ? homeChars : "/data/local/tmp";
+              std::string tmpStr = tmpChars ? tmpChars : "/data/local/tmp";
+              std::string libStr = libChars ? libChars : "/system/lib64";
+
+              if (homeChars) env->ReleaseStringUTFChars(homeDir, homeChars);
+              if (tmpChars) env->ReleaseStringUTFChars(tmpDir, tmpChars);
+              if (nativeLibDir && libChars) env->ReleaseStringUTFChars(nativeLibDir, libChars);
+
               int master = -1;
               pid_t pid = forkpty(&master, nullptr, nullptr, nullptr);
               if (pid < 0) return JNI_FALSE;
+
               if (pid == 0) {
+                  chdir(homeStr.c_str());
+                  setenv("HOME", homeStr.c_str(), 1);
+                  setenv("TMPDIR", tmpStr.c_str(), 1);
                   setenv("TERM", "xterm-256color", 1);
-                  setenv("PATH", "/system/bin:/system/xbin", 1);
+
+                  std::string pathEnv = homeStr + "/bin:" + homeStr + "/node_modules/.bin:/system/bin:/system/xbin";
+                  setenv("PATH", pathEnv.c_str(), 1);
+
+                  std::string ldEnv = libStr + ":" + homeStr + "/lib:/system/lib64:/system/lib";
+                  setenv("LD_LIBRARY_PATH", ldEnv.c_str(), 1);
+
                   execl("/system/bin/sh", "sh", nullptr);
                   _exit(127);
               }
+
               int flags = fcntl(master, F_GETFL, 0);
               fcntl(master, F_SETFL, flags | O_NONBLOCK);
               g_master = master;
@@ -162,17 +192,33 @@ jobs:
           import android.widget.*
           import androidx.appcompat.app.AppCompatActivity
           import com.google.android.material.card.MaterialCardView
+          import java.io.BufferedInputStream
+          import java.io.File
+          import java.io.FileOutputStream
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.util.concurrent.Executors
+          import java.util.zip.ZipInputStream
 
           class MainActivity : AppCompatActivity() {
               companion object { init { System.loadLibrary("agentterm") } }
-              external fun startShell(): Boolean
+
+              external fun startShell(homeDir: String, tmpDir: String, nativeLibDir: String): Boolean
               external fun sendRaw(data: String)
               external fun readOutput(): String
 
               private lateinit var cardsContainer: LinearLayout
               private lateinit var scrollView: ScrollView
+              private lateinit var inputBox: EditText
               private var currentOutputView: TextView? = null
               private val handler = Handler(Looper.getMainLooper())
+              private val ioExecutor = Executors.newCachedThreadPool()
+
+              private lateinit var workspaceDir: File
+              private lateinit var binDir: File
+              private lateinit var tmpDir: File
+              private var nativeLibDir: String = ""
+
               private val pollRunnable = object : Runnable {
                   override fun run() {
                       val chunk = readOutput()
@@ -183,22 +229,41 @@ jobs:
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
+
+                  workspaceDir = File(filesDir, "workspace").apply { mkdirs() }
+                  binDir = File(workspaceDir, "bin").apply { mkdirs() }
+                  tmpDir = File(cacheDir, "tmp").apply { mkdirs() }
+                  nativeLibDir = applicationInfo.nativeLibraryDir ?: ""
+
                   val root = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
                       setBackgroundColor(Color.parseColor("#0F172A"))
                       setPadding(24, 36, 24, 24)
                   }
+
                   val header = TextView(this).apply {
-                      text = "⚡ AgentTerm (Block Prototype)"
+                      text = "⚡ AgentTerm (Tool Loader & Shell)"
                       setTextColor(Color.parseColor("#38BDF8"))
-                      textSize = 18f
+                      textSize = 17f
                       setTypeface(null, Typeface.BOLD)
-                      setPadding(0, 0, 0, 20)
+                      setPadding(0, 0, 0, 12)
                   }
                   root.addView(header)
 
+                  val helpHint = TextView(this).apply {
+                      text = "أوامر مدمجة: fetch <url> [name] | runsh <file.sh> | envinfo"
+                      setTextColor(Color.parseColor("#94A3B8"))
+                      textSize = 11f
+                      setPadding(0, 0, 0, 10)
+                  }
+                  root.addView(helpHint)
+
                   scrollView = ScrollView(this).apply {
-                      layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
+                      layoutParams = LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT,
+                          0,
+                          1f
+                      )
                   }
                   cardsContainer = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
                   scrollView.addView(cardsContainer)
@@ -206,32 +271,48 @@ jobs:
 
                   val touchBar = LinearLayout(this).apply {
                       orientation = LinearLayout.HORIZONTAL
-                      setPadding(0, 12, 0, 12)
+                      setPadding(0, 10, 0, 10)
                   }
                   val quickKeys = listOf(
+                      "Env" to "ENV_INFO",
+                      "Fetch" to "PREFILL_FETCH",
                       "Ctrl+C" to "\u0003",
-                      "Tab" to "\t",
-                      "ls -la" to "ls -la\n",
-                      "pwd" to "pwd\n",
+                      "ls" to "ls -la\n",
                       "Clear" to "CLEAR"
                   )
                   for ((label, payload) in quickKeys) {
                       val btn = Button(this).apply {
                           text = label
-                          textSize = 12f
+                          textSize = 10f
+                          maxLines = 1
                           setTextColor(Color.WHITE)
                           setBackgroundColor(Color.parseColor("#1E293B"))
                           setOnClickListener {
-                              if (payload == "CLEAR") {
-                                  cardsContainer.removeAllViews()
-                                  currentOutputView = null
-                              } else {
-                                  if (payload.endsWith("\n")) addBlock(payload.trim())
-                                  sendRaw(payload)
+                              when (payload) {
+                                  "CLEAR" -> {
+                                      cardsContainer.removeAllViews()
+                                      currentOutputView = null
+                                  }
+                                  "ENV_INFO" -> {
+                                      addBlock("envinfo")
+                                      sendRaw("echo \"ARCH=\$(uname -m) | WS=${workspaceDir.absolutePath}\"; ls -la \"${workspaceDir.absolutePath}\"\n")
+                                  }
+                                  "PREFILL_FETCH" -> {
+                                      inputBox.setText("fetch https://")
+                                      inputBox.setSelection(inputBox.text.length)
+                                  }
+                                  else -> {
+                                      if (payload.endsWith("\n")) addBlock(payload.trim())
+                                      sendRaw(payload)
+                                  }
                               }
                           }
                       }
-                      touchBar.addView(btn, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { setMargins(6, 0, 6, 0) })
+                      touchBar.addView(
+                          btn,
+                          LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                              .apply { setMargins(3, 0, 3, 0) }
+                      )
                   }
                   root.addView(touchBar)
 
@@ -239,8 +320,8 @@ jobs:
                       orientation = LinearLayout.HORIZONTAL
                       gravity = Gravity.CENTER_VERTICAL
                   }
-                  val input = EditText(this).apply {
-                      hint = "اكتب أمراً هنا (مثل: uname -a)..."
+                  inputBox = EditText(this).apply {
+                      hint = "اكتب أمراً أو fetch <url>..."
                       setHintTextColor(Color.parseColor("#64748B"))
                       setTextColor(Color.WHITE)
                       setBackgroundColor(Color.parseColor("#1E293B"))
@@ -252,24 +333,145 @@ jobs:
                       setTextColor(Color.parseColor("#0F172A"))
                       setBackgroundColor(Color.parseColor("#38BDF8"))
                       setOnClickListener {
-                          val cmd = input.text.toString().trim()
-                          if (cmd.isNotEmpty()) {
-                              addBlock(cmd)
-                              sendRaw(cmd + "\n")
-                              input.text.clear()
+                          val rawCmd = inputBox.text.toString().trim()
+                          if (rawCmd.isNotEmpty()) {
+                              inputBox.text.clear()
+                              handleCommand(rawCmd)
                           }
                       }
                   }
-                  inputRow.addView(input)
+                  inputRow.addView(inputBox)
                   inputRow.addView(runBtn)
                   root.addView(inputRow)
                   setContentView(root)
 
-                  if (startShell()) {
-                      addBlock("Session Started (/system/bin/sh)")
+                  if (startShell(workspaceDir.absolutePath, tmpDir.absolutePath, nativeLibDir)) {
+                      addBlock("Session Started -> ${workspaceDir.absolutePath}")
                       handler.post(pollRunnable)
                   } else {
                       addBlock("Error: Failed to start PTY shell")
+                  }
+              }
+
+              private fun handleCommand(cmd: String) {
+                  when {
+                      cmd.equals("envinfo", ignoreCase = true) -> {
+                          addBlock(cmd)
+                          sendRaw("echo \"ARCH=\$(uname -m) | HOME=\$HOME | TMPDIR=\$TMPDIR\"; ls -la \"${workspaceDir.absolutePath}\"\n")
+                      }
+                      cmd.startsWith("fetch ", ignoreCase = true) -> {
+                          val parts = cmd.split(Regex("\\s+")).filter { it.isNotBlank() }
+                          if (parts.size < 2) {
+                              addBlock(cmd)
+                              appendOutput("الاستخدام: fetch <url> [output_name]\n")
+                              return
+                          }
+                          val urlStr = parts[1]
+                          val customName = if (parts.size >= 3) parts[2] else null
+                          addBlock(cmd)
+                          downloadAndExtract(urlStr, customName)
+                      }
+                      cmd.startsWith("runsh ", ignoreCase = true) -> {
+                          val target = cmd.removePrefix("runsh ").trim()
+                          addBlock(cmd)
+                          val scriptFile = resolveWorkspaceFile(target)
+                          if (!scriptFile.exists()) {
+                              appendOutput("الملف غير موجود: ${scriptFile.absolutePath}\n")
+                          } else {
+                              sendRaw("sh \"${scriptFile.absolutePath}\"\n")
+                          }
+                      }
+                      else -> {
+                          addBlock(cmd)
+                          sendRaw(cmd + "\n")
+                      }
+                  }
+              }
+
+              private fun resolveWorkspaceFile(nameOrPath: String): File {
+                  val f = File(nameOrPath)
+                  return if (f.isAbsolute) f else File(workspaceDir, nameOrPath)
+              }
+
+              private fun downloadAndExtract(urlStr: String, customName: String?) {
+                  appendOutput("جارٍ التحميل: $urlStr ...\n")
+                  ioExecutor.execute {
+                      try {
+                          val url = URL(urlStr)
+                          val conn = (url.openConnection() as HttpURLConnection).apply {
+                              connectTimeout = 15000
+                              readTimeout = 30000
+                              instanceFollowRedirects = true
+                              setRequestProperty("User-Agent", "AgentTerm-Android")
+                          }
+                          val code = conn.responseCode
+                          if (code !in 200..299) {
+                              runOnUiThread { appendOutput("فشل التحميل: HTTP $code\n") }
+                              conn.disconnect()
+                              return@execute
+                          }
+
+                          val rawName = customName
+                              ?: url.path.substringAfterLast('/').takeIf { it.isNotBlank() }
+                              ?: "downloaded_file"
+                          val outFile = File(workspaceDir, rawName)
+
+                          conn.inputStream.use { input ->
+                              FileOutputStream(outFile).use { output ->
+                                  val buf = ByteArray(8192)
+                                  var total = 0L
+                                  var readBytes: Int
+                                  while (input.read(buf).also { readBytes = it } != -1) {
+                                      output.write(buf, 0, readBytes)
+                                      total += readBytes
+                                  }
+                                  runOnUiThread {
+                                      appendOutput("تم الحفظ: ${outFile.absolutePath} ($total bytes)\n")
+                                  }
+                              }
+                          }
+                          conn.disconnect()
+
+                          if (rawName.endsWith(".zip", ignoreCase = true)) {
+                              val extractDir = File(workspaceDir, rawName.removeSuffix(".zip")).apply { mkdirs() }
+                              extractZip(outFile, extractDir)
+                              runOnUiThread {
+                                  appendOutput("تم فك ضغط ZIP إلى: ${extractDir.absolutePath}\n")
+                              }
+                          } else {
+                              outFile.setExecutable(true, false)
+                              runOnUiThread {
+                                  appendOutput("ملاحظة: في أندرويد قد يمنع النظام تنفيذ الملفات مباشرة من filesDir؛ استخدم runsh للملفات النصية أو راجع قيود التنفيذ.\n")
+                              }
+                          }
+                      } catch (e: Exception) {
+                          runOnUiThread {
+                              appendOutput("خطأ أثناء التحميل: ${e.message}\n")
+                          }
+                      }
+                  }
+              }
+
+              private fun extractZip(zipFile: File, destDir: File) {
+                  ZipInputStream(BufferedInputStream(zipFile.inputStream())).use { zis ->
+                      var entry = zis.nextEntry
+                      while (entry != null) {
+                          val outFile = File(destDir, entry.name)
+                          if (entry.isDirectory) {
+                              outFile.mkdirs()
+                          } else {
+                              outFile.parentFile?.mkdirs()
+                              FileOutputStream(outFile).use { fos ->
+                                  val buf = ByteArray(8192)
+                                  var len: Int
+                                  while (zis.read(buf).also { len = it } != -1) {
+                                      fos.write(buf, 0, len)
+                                  }
+                              }
+                          }
+                          zis.closeEntry()
+                          entry = zis.nextEntry
+                      }
                   }
               }
 
@@ -278,7 +480,10 @@ jobs:
                       setCardBackgroundColor(Color.parseColor("#1E293B"))
                       radius = 24f
                       cardElevation = 4f
-                      layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { setMargins(0, 0, 0, 20) }
+                      layoutParams = LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT,
+                          LinearLayout.LayoutParams.WRAP_CONTENT
+                      ).apply { setMargins(0, 0, 0, 20) }
                   }
                   val box = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
@@ -310,6 +515,12 @@ jobs:
                   currentOutputView?.append(text)
                   scrollView.post { scrollView.fullScroll(ScrollView.FOCUS_DOWN) }
               }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  handler.removeCallbacks(pollRunnable)
+                  ioExecutor.shutdownNow()
+              }
           }
           EOF
 
@@ -326,4 +537,3 @@ jobs:
         with:
           name: AgentTerm-APK
           path: app/build/outputs/apk/debug/app-debug.apk
- 
