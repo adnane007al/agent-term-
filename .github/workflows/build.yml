@@ -61,8 +61,8 @@ jobs:
                   applicationId = "com.example.agentterm"
                   minSdk = 24
                   targetSdk = 34
-                  versionCode = 2
-                  versionName = "1.3"
+                  versionCode = 3
+                  versionName = "1.4"
                   ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
               }
               externalNativeBuild { cmake { path = file("src/main/cpp/CMakeLists.txt") } }
@@ -194,10 +194,13 @@ jobs:
           import com.google.android.material.card.MaterialCardView
           import java.io.BufferedInputStream
           import java.io.File
+          import java.io.FileInputStream
           import java.io.FileOutputStream
+          import java.io.InputStream
           import java.net.HttpURLConnection
           import java.net.URL
           import java.util.concurrent.Executors
+          import java.util.zip.GZIPInputStream
           import java.util.zip.ZipInputStream
 
           class MainActivity : AppCompatActivity() {
@@ -251,7 +254,7 @@ jobs:
                   root.addView(header)
 
                   val helpHint = TextView(this).apply {
-                      text = "أوامر مدمجة: fetch <url> [name] | runsh <file.sh> | envinfo"
+                      text = "أوامر: fetch <url> [name] | runsh <file.sh> | runbin <path> | envinfo"
                       setTextColor(Color.parseColor("#94A3B8"))
                       textSize = 11f
                       setPadding(0, 0, 0, 10)
@@ -381,6 +384,24 @@ jobs:
                               sendRaw("sh \"${scriptFile.absolutePath}\"\n")
                           }
                       }
+                      cmd.startsWith("runbin ", ignoreCase = true) -> {
+                          val rawArgs = cmd.removePrefix("runbin ").trim()
+                          addBlock(cmd)
+                          if (rawArgs.isEmpty()) {
+                              appendOutput("الاستخدام: runbin <path> [args...]\n")
+                              return
+                          }
+                          val tokens = rawArgs.split(Regex("\\s+"))
+                          val binFile = resolveWorkspaceFile(tokens[0])
+                          if (!binFile.exists()) {
+                              appendOutput("الثنائي غير موجود: ${binFile.absolutePath}\n")
+                              return
+                          }
+                          binFile.setExecutable(true, false)
+                          val argsStr = if (tokens.size > 1) " " + tokens.drop(1).joinToString(" ") else ""
+                          appendOutput("تنبيه: في أندرويد قد يمنع النظام تنفيذ الثنائيات مباشرة من filesDir (Permission denied).\n")
+                          sendRaw("\"${binFile.absolutePath}\"$argsStr\n")
+                      }
                       else -> {
                           addBlock(cmd)
                           sendRaw(cmd + "\n")
@@ -432,16 +453,29 @@ jobs:
                           }
                           conn.disconnect()
 
-                          if (rawName.endsWith(".zip", ignoreCase = true)) {
-                              val extractDir = File(workspaceDir, rawName.removeSuffix(".zip")).apply { mkdirs() }
-                              extractZip(outFile, extractDir)
-                              runOnUiThread {
-                                  appendOutput("تم فك ضغط ZIP إلى: ${extractDir.absolutePath}\n")
+                          when {
+                              rawName.endsWith(".zip", ignoreCase = true) -> {
+                                  val extractDir = File(workspaceDir, rawName.removeSuffix(".zip")).apply { mkdirs() }
+                                  extractZip(outFile, extractDir)
+                                  runOnUiThread {
+                                      appendOutput("تم فك ضغط ZIP إلى: ${extractDir.absolutePath}\n")
+                                  }
                               }
-                          } else {
-                              outFile.setExecutable(true, false)
-                              runOnUiThread {
-                                  appendOutput("ملاحظة: في أندرويد قد يمنع النظام تنفيذ الملفات مباشرة من filesDir؛ استخدم runsh للملفات النصية أو راجع قيود التنفيذ.\n")
+                              rawName.endsWith(".tar.gz", ignoreCase = true) || rawName.endsWith(".tgz", ignoreCase = true) -> {
+                                  val baseName = rawName
+                                      .removeSuffix(".tar.gz")
+                                      .removeSuffix(".tgz")
+                                  val extractDir = File(workspaceDir, baseName).apply { mkdirs() }
+                                  val extractedCount = extractTarGz(outFile, extractDir)
+                                  runOnUiThread {
+                                      appendOutput("تم فك ضغط TAR.GZ ($extractedCount ملف/مجلد) إلى: ${extractDir.absolutePath}\n")
+                                  }
+                              }
+                              else -> {
+                                  outFile.setExecutable(true, false)
+                                  runOnUiThread {
+                                      appendOutput("ملاحظة: في أندرويد قد يمنع النظام تنفيذ الملفات مباشرة من filesDir؛ استخدم runsh للملفات النصية أو runbin لاختبار الثنائيات.\n")
+                                  }
                               }
                           }
                       } catch (e: Exception) {
@@ -473,6 +507,110 @@ jobs:
                           entry = zis.nextEntry
                       }
                   }
+              }
+
+              private fun extractTarGz(tarGzFile: File, destDir: File): Int {
+                  var count = 0
+                  BufferedInputStream(GZIPInputStream(FileInputStream(tarGzFile))).use { tarStream ->
+                      val header = ByteArray(512)
+                      while (true) {
+                          val headerRead = readFully(tarStream, header, 0, 512)
+                          if (headerRead < 512) break
+                          if (header.all { it == 0.toByte() }) break
+
+                          val rawEntryName = parseTarString(header, 0, 100)
+                          val prefix = parseTarString(header, 345, 155)
+                          val entryName = if (prefix.isNotEmpty()) "$prefix/$rawEntryName" else rawEntryName
+                          val size = parseTarOctal(header, 124, 12)
+                          val typeFlag = header[156].toInt().toChar()
+
+                          if (entryName.isNotEmpty()) {
+                              val cleanName = entryName.removePrefix("./")
+                              val outFile = File(destDir, cleanName)
+                              when (typeFlag) {
+                                  '5' -> {
+                                      outFile.mkdirs()
+                                      count++
+                                  }
+                                  '0', '\u0000' -> {
+                                      outFile.parentFile?.mkdirs()
+                                      FileOutputStream(outFile).use { fos ->
+                                          copyExactBytes(tarStream, fos, size)
+                                      }
+                                      outFile.setExecutable(true, false)
+                                      count++
+                                  }
+                                  else -> {
+                                      skipExactBytes(tarStream, size)
+                                  }
+                              }
+                          } else {
+                              skipExactBytes(tarStream, size)
+                          }
+
+                          val remainder = (size % 512).toInt()
+                          if (remainder > 0) {
+                              skipExactBytes(tarStream, (512 - remainder).toLong())
+                          }
+                      }
+                  }
+                  return count
+              }
+
+              private fun readFully(input: InputStream, buf: ByteArray, offset: Int, len: Int): Int {
+                  var total = 0
+                  while (total < len) {
+                      val n = input.read(buf, offset + total, len - total)
+                      if (n <= 0) break
+                      total += n
+                  }
+                  return total
+              }
+
+              private fun copyExactBytes(input: InputStream, fos: FileOutputStream, size: Long) {
+                  var remaining = size
+                  val buf = ByteArray(8192)
+                  while (remaining > 0) {
+                      val toRead = minOf(remaining, buf.size.toLong()).toInt()
+                      val n = input.read(buf, 0, toRead)
+                      if (n <= 0) break
+                      fos.write(buf, 0, n)
+                      remaining -= n
+                  }
+              }
+
+              private fun skipExactBytes(input: InputStream, count: Long) {
+                  var remaining = count
+                  val buf = ByteArray(4096)
+                  while (remaining > 0) {
+                      val toRead = minOf(remaining, buf.size.toLong()).toInt()
+                      val n = input.read(buf, 0, toRead)
+                      if (n <= 0) break
+                      remaining -= n
+                  }
+              }
+
+              private fun parseTarString(buf: ByteArray, offset: Int, length: Int): String {
+                  var end = offset + length
+                  for (i in offset until offset + length) {
+                      if (buf[i] == 0.toByte()) {
+                          end = i
+                          break
+                      }
+                  }
+                  return String(buf, offset, end - offset, Charsets.UTF_8).trim()
+              }
+
+              private fun parseTarOctal(buf: ByteArray, offset: Int, length: Int): Long {
+                  var value = 0L
+                  for (i in offset until offset + length) {
+                      val b = buf[i].toInt() and 0xFF
+                      if (b == 0 || b == ' '.code) continue
+                      if (b in '0'.code..'7'.code) {
+                          value = (value shl 3) or (b - '0'.code)
+                      }
+                  }
+                  return value
               }
 
               private fun addBlock(commandTitle: String) {
